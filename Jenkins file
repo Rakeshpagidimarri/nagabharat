@@ -1,1 +1,112 @@
+pipeline {
+    agent any
 
+    environment {
+        DEV_ENV = "dev.inventory"
+        QA_ENV = "qa.inventory"
+        UAT_ENV = "uat.inventory"
+        SONARQUBE_ENV = "SonarQube"
+    }
+
+    parameters {
+        string(name: 'ARTIFACT_VERSION', defaultValue: 'latest', description: 'Artifact version to deploy')
+        string(name: 'TARGET_ENV', defaultValue: 'dev', description: 'Target environment for deployment (dev, qa, uat)')
+        booleanParam(name: 'PROMOTE', defaultValue: false, description: 'Promote build to QA/UAT?')
+    }
+
+    stages {
+        stage('Check Branch Inactivity') {
+            steps {
+                script {
+                    def branch = env.BRANCH_NAME
+                    echo "Checking activity for branch: ${branch}"
+
+                    def lastCommitDate = sh(script: "git log -1 --format=%cd --date=iso", returnStdout: true).trim()
+                    def daysSinceLastCommit = sh(script: "echo $(( ($(date +%s) - $(date -d '${lastCommitDate}' +%s) ) / 86400 ))", returnStdout: true).trim().toInteger()
+
+                    if (daysSinceLastCommit > 60) {
+                        error "🚨 Branch '${branch}' inactive for ${daysSinceLastCommit} days. Pipeline disabled!"
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/' + env.BRANCH_NAME]],
+                    extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '', shallow: false]],
+                    userRemoteConfigs: [[url: 'git@bitbucket.org:your-repo.git', credentialsId: 'BITBUCKET_CRED_ID']]
+                ])
+            }
+        }
+
+        stage('SonarQube Code Analysis') {
+            when { branch 'develop' }
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    sh './gradlew sonarqube'
+                }
+            }
+        }
+
+        stage('Quality Gate Check') {
+            when { branch 'develop' }
+            steps {
+                waitForQualityGate abortPipeline: true
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh './gradlew clean build'
+            }
+        }
+
+        stage('Deploy to Development') {
+            when { expression { return params.TARGET_ENV == 'dev' } }
+            steps {
+                script {
+                    def version = params.ARTIFACT_VERSION ?: "latest"
+                    echo "Deploying version ${version} to Development"
+
+                    withCredentials([sshUserPrivateKey(credentialsId: 'SSH_CRED_ID', keyFileVariable: 'SSH_KEY')]) {
+                        sh """
+                            ssh -i $SSH_KEY user@${DEV_ENV} 'cp /opt/app/app.jar /opt/app/app.jar.bak'
+                            scp -i $SSH_KEY build/libs/*.jar user@${DEV_ENV}:/opt/app/
+                            ssh -i $SSH_KEY user@${DEV_ENV} 'sudo systemctl restart app'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Manual Promotion to QA and UAT') {
+            when { expression { return params.PROMOTE == true } }
+            steps {
+                input "🚀 Deploy to QA and UAT?"
+                script {
+                    def version = params.ARTIFACT_VERSION ?: "latest"
+                    echo "Promoting version ${version} to QA and UAT"
+
+                    withCredentials([sshUserPrivateKey(credentialsId: 'SSH_CRED_ID', keyFileVariable: 'SSH_KEY')]) {
+                        sh """
+                            scp -i $SSH_KEY build/libs/*.jar user@${QA_ENV}:/opt/app/
+                            ssh -i $SSH_KEY user@${QA_ENV} 'sudo systemctl restart app'
+                            
+                            scp -i $SSH_KEY build/libs/*.jar user@${UAT_ENV}:/opt/app/
+                            ssh -i $SSH_KEY user@${UAT_ENV} 'sudo systemctl restart app'
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo '✅ Build and Deployment Successful!' }
+        failure { echo '❌ Build or Deployment Failed!' }
+        always { echo "📌 Pipeline completed for branch: ${env.BRANCH_NAME}" }
+    }
+}
